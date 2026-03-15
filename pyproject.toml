@@ -1,0 +1,11 @@
+[project]
+name = "ensamble"
+version = "0.1.0"
+description = "ensambleai"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "dotenv>=0.9.9",
+    "torch>=2.10.0",
+    "ultralytics>=8.4.21",
+]

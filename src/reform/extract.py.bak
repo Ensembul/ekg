@@ -1,0 +1,436 @@
+"""
+ECG signal extraction — mask-based vectorisation approach.
+
+Ported from ECG-digitiser with corrections:
+  - 10 mm = 1 mV (not µV)
+  - each block = 2.5 s at 500 Hz = 1250 samples
+  - grid is always 4×3
+
+Pipeline
+--------
+  pil_image
+      └─ standardize()                resize + binarize  (signal mask)
+          └─ chop_leads()             equal-grid slice into 4×3 lead blocks
+              └─ extract_column_signal()  mean/median Y of signal pixels per column
+                  └─ calibrate()         derive mV_per_pixel from grid spacing
+                      └─ vectorise()     shift baseline, scale to mV, resample to 1250
+                          └─ filter()    optional HP/LP
+                              └─ zero-pad into 5000-sample output vector
+
+Unit grounding
+--------------
+Amplitude:  mm_per_pixel = 25 × sec_per_pixel       (25 mm/s paper speed)
+            mV_per_pixel = mm_per_pixel / 10         (10 mm/mV standard)
+            signal_mV = (baseline_y − pixel_y) × mV_per_pixel
+
+Time:       Each short lead in the 4×3 grid = 2.5 s
+            sec_per_pixel = 2.5 / lead_width_in_pixels
+            Resample each lead to 1250 samples (2.5 s × 500 Hz)
+            Zero-pad into 5000-sample (10 s) output vector at correct offset
+
+Lead layout (always 4×3)
+-------------------------
+  col 0   col 1   col 2   col 3     time window
+  I       aVR     V1      V4        0–2.5s / 2.5–5s / 5–7.5s / 7.5–10s
+  II      aVL     V2      V5
+  III     aVF     V3      V6
+"""
+
+import cv2
+import numpy as np
+from PIL import Image
+from scipy.interpolate import interp1d
+from scipy.signal import butter, filtfilt, find_peaks
+
+from binarize import (
+    adaptive_binarize,
+    canny_binarize,
+    color_filter_binarize,
+    otsu_binarize,
+)
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Constants
+# ──────────────────────────────────────────────────────────────────────────────
+
+STANDARD_W = 3300  # target width after resize  (px)
+STANDARD_H = 2550  # target height after resize (px)
+OUTPUT_SAMPLES = 5000  # 500 Hz × 10 s
+SAMPLE_RATE_HZ = 500
+LEAD_SAMPLES = 1250  # 500 Hz × 2.5 s per block
+SHORT_SIGNAL_LENGTH_SEC = 2.5
+LONG_SIGNAL_LENGTH_SEC = 10.0
+
+# Always 4×3 grid: 4 columns × 3 rows
+LEAD_GRID = [
+    ["I", "aVR", "V1", "V4"],
+    ["II", "aVL", "V2", "V5"],
+    ["III", "aVF", "V3", "V6"],
+]
+
+# Temporal slot of each lead inside the 5000-sample output vector
+# Column 0 → 0–2.5s, Column 1 → 2.5–5s, Column 2 → 5–7.5s, Column 3 → 7.5–10s
+LEAD_SLOTS = {
+    "I": (0, 1250),
+    "aVR": (1250, 2500),
+    "V1": (2500, 3750),
+    "V4": (3750, 5000),
+    "II": (0, 1250),
+    "aVL": (1250, 2500),
+    "V2": (2500, 3750),
+    "V5": (3750, 5000),
+    "III": (0, 1250),
+    "aVF": (1250, 2500),
+    "V3": (2500, 3750),
+    "V6": (3750, 5000),
+}
+
+# Lead label mapping (segmentation model labels)
+LEAD_LABEL_MAPPING = {
+    "I": 1,
+    "II": 2,
+    "III": 3,
+    "aVR": 4,
+    "aVL": 5,
+    "aVF": 6,
+    "V1": 7,
+    "V2": 8,
+    "V3": 9,
+    "V4": 10,
+    "V5": 11,
+    "V6": 12,
+}
+
+# Vertical baseline position ratios (from ECG-digitiser)
+# page height = 21.59 cm (8.5 inches); numerator = cm from bottom
+Y_SHIFT_RATIO = {
+    "I": 12.6 / 21.59,
+    "II": 9.0 / 21.59,
+    "III": 5.4 / 21.59,
+    "aVR": 12.6 / 21.59,
+    "aVL": 9.0 / 21.59,
+    "aVF": 5.4 / 21.59,
+    "V1": 12.59 / 21.59,
+    "V2": 9.0 / 21.59,
+    "V3": 5.4 / 21.59,
+    "V4": 12.59 / 21.59,
+    "V5": 9.0 / 21.59,
+    "V6": 5.4 / 21.59,
+    "full": 2.1 / 21.59,
+}
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Step 1 — Standardize (binarize to get signal mask)
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+def standardize(pil_image: Image.Image, binarize: str = "color") -> np.ndarray:
+    """
+    Resize to STANDARD_W × STANDARD_H and binarize.
+
+    Returns uint8 array (H × W): 255 = signal pixel, 0 = background.
+
+    binarize : "color"    — HSV color filter (recommended; removes pink/red/blue
+                            grid lines before thresholding the dark ECG trace)
+               "canny"    — Canny edges + Hough line removal; useful for faded
+                            prints where the grid and signal have similar intensity
+               "otsu"     — global Otsu on grayscale (fast, but includes grid)
+               "adaptive" — local Gaussian threshold (handles uneven lighting)
+    """
+    resized = pil_image.resize((STANDARD_W, STANDARD_H), Image.LANCZOS)
+
+    if binarize == "color":
+        return np.array(color_filter_binarize(resized))
+    elif binarize == "canny":
+        return np.array(canny_binarize(resized))
+    elif binarize == "adaptive":
+        return np.array(adaptive_binarize(resized))
+    else:  # "otsu"
+        return np.array(otsu_binarize(resized, direction="global"))
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Step 2 — Chop into lead blocks (always 4×3)
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+def chop_leads(
+    binary: np.ndarray,
+    header_frac: float = 0.08,
+    cal_frac: float = 0.03,
+) -> dict[str, np.ndarray]:
+    """
+    Slice the binary image into one rectangular block per lead (4×3 grid).
+
+    binary      : standardized binary image (H × W), 255 = signal
+    header_frac : fraction of total height to skip at the top
+    cal_frac    : fraction of total width to skip at the left edge
+
+    Returns dict[lead_name → 2D uint8 block, 255 = signal].
+    """
+    n_rows = len(LEAD_GRID)
+    n_cols = len(LEAD_GRID[0])
+
+    H, W = binary.shape
+    header_px = int(H * header_frac)
+    cal_px = int(W * cal_frac)
+
+    usable = binary[header_px:, cal_px:]
+    h, w = usable.shape
+
+    row_h = h // n_rows
+    col_w = w // n_cols
+
+    blocks: dict[str, np.ndarray] = {}
+    for r, row_names in enumerate(LEAD_GRID):
+        for c, name in enumerate(row_names):
+            blocks[name] = usable[
+                r * row_h : (r + 1) * row_h, c * col_w : (c + 1) * col_w
+            ]
+
+    return blocks
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Step 3 — Column-by-column signal extraction
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+def extract_column_signal(block: np.ndarray, method: str = "mean") -> np.ndarray:
+    """
+    For each column in the block, collect Y-coordinates of signal (white=255)
+    pixels and reduce to a single Y position.
+
+    method : "mean"   — mean Y of signal pixels (ECG-digitiser approach)
+             "median" — median Y (more robust to thick lines / noise)
+
+    Empty columns are NaN-filled and then linearly interpolated.
+    Returns 1D float array of Y pixel positions, length = block width.
+    """
+    n_cols = block.shape[1]
+    signal = np.full(n_cols, np.nan)
+    reduce_fn = np.mean if method == "mean" else np.median
+
+    for col in range(n_cols):
+        white_rows = np.where(block[:, col] == 255)[0]
+        if len(white_rows) > 0:
+            signal[col] = float(reduce_fn(white_rows))
+
+    nan_mask = np.isnan(signal)
+    if nan_mask.all():
+        return np.zeros(n_cols)
+    if nan_mask.any():
+        idx = np.arange(n_cols)
+        signal[nan_mask] = np.interp(idx[nan_mask], idx[~nan_mask], signal[~nan_mask])
+
+    return signal
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Step 4 — Calibration: derive mV_per_pixel
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+def compute_calibration(
+    blocks: dict[str, np.ndarray],
+) -> tuple[float, float]:
+    """
+    Derive the physical calibration factors from the lead block widths.
+
+    Uses the ECG-digitiser approach:
+      1. Collect pixel-widths of all lead blocks
+      2. Median width → each short lead is 2.5 s
+      3. sec_per_pixel = 2.5 / mean_width
+      4. mm_per_pixel  = 25 × sec_per_pixel   (25 mm/s paper speed)
+      5. mV_per_pixel  = mm_per_pixel / 10     (10 mm = 1 mV)
+
+    Returns (sec_per_pixel, mV_per_pixel).
+    """
+    widths = [block.shape[1] for block in blocks.values() if block is not None]
+    if not widths:
+        # Fallback: assume A4 landscape ≈ 297 mm wide
+        px_per_mm = STANDARD_W / 297.0
+        return 1.0 / (px_per_mm * 25.0), 1.0 / (px_per_mm * 10.0)
+
+    median_w = np.median(widths)
+    # Filter out any "long" lead (> 2× median) — in a pure 4×3 grid this
+    # shouldn't happen, but be safe
+    short_widths = [w for w in widths if w < 2 * median_w]
+    mean_w = float(np.mean(short_widths)) if short_widths else float(median_w)
+
+    sec_per_pixel = SHORT_SIGNAL_LENGTH_SEC / mean_w  # 2.5 / width_px
+    mm_per_pixel = 25.0 * sec_per_pixel  # 25 mm/s
+    mV_per_pixel = mm_per_pixel / 10.0  # 10 mm/mV
+
+    return sec_per_pixel, mV_per_pixel
+
+
+def detect_grid_spacing(pil_image: Image.Image) -> float | None:
+    """
+    Estimates the ECG grid period in pixels/mm by autocorrelation of the
+    image intensity profile. Run on the original image (before resizing) so
+    the colored grid lines are maximally visible.
+
+    Returns pixels_per_mm (on the original image), or None if detection fails.
+    """
+    img_np = np.array(pil_image)
+    gray = cv2.cvtColor(img_np, cv2.COLOR_RGB2GRAY) if img_np.ndim == 3 else img_np
+
+    estimates = []
+    for profile in (gray.mean(axis=0), gray.mean(axis=1)):
+        profile = profile.astype(float)
+        profile -= profile.mean()
+
+        autocorr = np.correlate(profile, profile, mode="full")
+        autocorr = autocorr[len(autocorr) // 2 :]
+        if autocorr[0] == 0:
+            continue
+        autocorr /= autocorr[0]
+
+        peaks, _ = find_peaks(autocorr, distance=3, height=0.05)
+        if len(peaks) < 3:
+            continue
+
+        period_px = float(np.median(np.diff(peaks[:10])))
+        if period_px > 24:
+            period_px /= 5.0
+        if 2.0 <= period_px <= 25.0:
+            estimates.append(period_px)
+
+    return float(np.mean(estimates)) if estimates else None
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Step 5 — Vectorise: convert pixel signal to mV + resample
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+def vectorise(
+    raw_y: np.ndarray,
+    mV_per_pixel: float,
+    target_samples: int = LEAD_SAMPLES,
+) -> np.ndarray:
+    """
+    Convert a raw Y-pixel signal to millivolts and resample to target length.
+
+    1. Centre at 0 mV by subtracting mean Y
+    2. Invert Y axis (higher pixel row = lower voltage)
+    3. Scale by mV_per_pixel
+    4. Resample to target_samples (1250 for 2.5s at 500Hz)
+
+    Returns 1D float array in mV, length = target_samples.
+    """
+    if mV_per_pixel == 0:
+        return np.zeros(target_samples)
+
+    # Centre and invert: higher Y (lower on image) = lower voltage
+    baseline_y = float(np.mean(raw_y))
+    signal_mv = (baseline_y - raw_y) * mV_per_pixel
+
+    # Resample to target length
+    if len(signal_mv) == target_samples:
+        return signal_mv.copy()
+
+    x_old = np.linspace(0.0, 1.0, len(signal_mv))
+    x_new = np.linspace(0.0, 1.0, target_samples)
+    return interp1d(x_old, signal_mv, kind="linear")(x_new)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Filters
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+def highpass_filter(
+    signal: np.ndarray,
+    cutoff_hz: float = 0.5,
+    sample_rate: float = SAMPLE_RATE_HZ,
+    order: int = 4,
+) -> np.ndarray:
+    """Zero-phase Butterworth high-pass filter to remove baseline wander."""
+    nyq = sample_rate / 2.0
+    b, a = butter(order, cutoff_hz / nyq, btype="high")
+    return filtfilt(b, a, signal)
+
+
+def lowpass_filter(
+    signal: np.ndarray,
+    cutoff_hz: float = 40.0,
+    sample_rate: float = SAMPLE_RATE_HZ,
+    order: int = 4,
+) -> np.ndarray:
+    """Zero-phase Butterworth low-pass filter to remove HF noise."""
+    nyq = sample_rate / 2.0
+    b, a = butter(order, cutoff_hz / nyq, btype="low")
+    return filtfilt(b, a, signal)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Top-level pipeline
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+def digitize(
+    pil_image: Image.Image,
+    header_frac: float = 0.08,
+    cal_frac: float = 0.03,
+    hp_cutoff: float = 0.5,
+    lp_cutoff: float = 40.0,
+    binarize: str = "color",
+    extract_method: str = "mean",
+) -> dict[str, np.ndarray]:
+    """
+    Full digitization pipeline: image → named mV lead signals.
+
+    Always uses 4×3 grid layout.
+
+    pil_image      : RGB PIL image of the ECG
+    header_frac    : fraction of image height to skip as patient info header
+    cal_frac       : fraction of image width to skip as calibration pulse
+    hp_cutoff      : high-pass cutoff Hz (None to skip)
+    lp_cutoff      : low-pass cutoff Hz (None to skip)
+    binarize       : "color" | "canny" | "otsu" | "adaptive"
+    extract_method : "mean" | "median" — how to reduce column pixels to Y value
+
+    Returns dict[lead_name → np.ndarray mV, length = OUTPUT_SAMPLES (5000)]
+    Each lead has 1250 non-zero samples at its correct temporal slot, rest zero.
+    """
+    # Binarize
+    binary = standardize(pil_image, binarize=binarize)
+
+    # Chop into 4×3 grid
+    blocks = chop_leads(binary, header_frac=header_frac, cal_frac=cal_frac)
+
+    # Calibration: derive mV_per_pixel from block widths
+    # 2.5s per block, 25 mm/s → mm_per_pixel, then / 10 → mV_per_pixel
+    _, mV_per_pixel = compute_calibration(blocks)
+
+    # Also try grid-spacing detection as a cross-check / alternative
+    grid_ppm = detect_grid_spacing(pil_image)
+    if grid_ppm is not None:
+        # Scale from original image coords to standardized coords
+        grid_mV_per_pixel = 1.0 / (grid_ppm * (STANDARD_W / pil_image.width) * 10.0)
+        # Use grid-detected calibration if it seems reasonable
+        ratio = mV_per_pixel / grid_mV_per_pixel if grid_mV_per_pixel > 0 else 0
+        if 0.3 < ratio < 3.0:
+            mV_per_pixel = grid_mV_per_pixel
+
+    # Extract, vectorise, filter, and place each lead
+    leads: dict[str, np.ndarray] = {}
+    for name, block in blocks.items():
+        raw_y = extract_column_signal(block, method=extract_method)
+        signal_mv = vectorise(raw_y, mV_per_pixel, target_samples=LEAD_SAMPLES)
+
+        if hp_cutoff is not None:
+            signal_mv = highpass_filter(signal_mv, cutoff_hz=hp_cutoff)
+        if lp_cutoff is not None:
+            signal_mv = lowpass_filter(signal_mv, cutoff_hz=lp_cutoff)
+
+        # Place into 5000-sample output at the correct temporal slot
+        out = np.zeros(OUTPUT_SAMPLES)
+        start, end = LEAD_SLOTS[name]
+        out[start:end] = signal_mv
+        leads[name] = out
+
+    return leads
